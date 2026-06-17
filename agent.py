@@ -8,7 +8,7 @@ from anthropic import Anthropic
 anthropic = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 OWNERREZ_API   = "https://api.ownerrez.com/v2"
-OWNERREZ_TOKEN = os.environ["OWNERREZ_TOKEN"]          # bearer token from Night Shift
+OWNERREZ_TOKEN = os.environ["OWNERREZ_TOKEN"]
 SLACK_TOKEN    = os.environ["SLACK_BOT_TOKEN"]
 SLACK_CHANNEL  = os.environ.get("SLACK_CHANNEL", "maintenance-rufus")
 
@@ -22,7 +22,8 @@ OR_HEADERS = {
 
 def get_recent_reviews(days_back: int = 1) -> list[dict]:
     """Fetch reviews submitted in the last `days_back` days."""
-    since = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%dT00:00:00Z")
+    from datetime import timezone
+    since = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT00:00:00Z")
     resp = requests.get(
         f"{OWNERREZ_API}/reviews",
         headers=OR_HEADERS,
@@ -54,7 +55,9 @@ def get_property_name(property_id: int) -> str:
 
 SYSTEM_PROMPT = """You are a property maintenance analyst for a short-term rental company.
 
-Your job: read guest reviews and extract ONLY maintenance issues or home improvement needs.
+Your job: read guest reviews (public and/or private) and extract ONLY maintenance issues or home improvement needs.
+
+Private feedback is often more candid and detailed — treat it with equal importance to the public review.
 
 For EACH issue found, return a JSON object with:
 - issue: short description (e.g. "Dripping kitchen faucet")
@@ -62,11 +65,12 @@ For EACH issue found, return a JSON object with:
 - urgency: one of RECOMMENDATION / LOW / MEDIUM / HIGH
 - detail: the relevant quote or paraphrase from the review
 - suggested_task: a clear task title a maintenance tech would understand
+- source: either "public" or "private" — where the issue was mentioned
 
 Urgency guide:
 - RECOMMENDATION: nice-to-have improvement, no impact on guest experience
 - LOW: minor annoyance, fix within 30 days
-- MEDIUM: noticeable problem, fix within 7 days  
+- MEDIUM: noticeable problem, fix within 7 days
 - HIGH: affects safety, habitability, or next guest's stay — fix ASAP
 
 Return ONLY a JSON array. If no maintenance issues exist, return [].
@@ -86,7 +90,6 @@ def analyze_review(review_text: str) -> list[dict]:
     )
 
     raw = response.content[0].text.strip()
-    # Strip markdown fences if Claude adds them
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -115,10 +118,8 @@ def post_to_slack(property_name: str, review: dict, issues: list[dict]) -> None:
     rating     = review.get("rating") or review.get("overall_rating", "?")
     review_url = review.get("url") or ""
 
-    # Sort by urgency
     issues = sorted(issues, key=lambda x: URGENCY_ORDER.get(x.get("urgency", "LOW"), 99))
 
-    # Build issue bullets
     bullets = []
     for i in issues:
         emoji   = URGENCY_EMOJI.get(i.get("urgency", "LOW"), "⚪")
@@ -126,9 +127,11 @@ def post_to_slack(property_name: str, review: dict, issues: list[dict]) -> None:
         task    = i.get("suggested_task", i.get("issue", "Unknown issue"))
         loc     = i.get("location", "")
         detail  = i.get("detail", "")
-        line = f"{emoji} *[{urgency}]* {task}"
+        source  = i.get("source", "")
+        source_tag = " 🔒 _private_" if source == "private" else ""
+        line = f"{emoji} *[{urgency}]* {task}{source_tag}"
         if loc:
-            line += f" _(_{loc}_)_"
+            line += f" _({loc})_"
         if detail:
             line += f"\n   > _{detail}_"
         bullets.append(line)
@@ -158,7 +161,7 @@ def post_to_slack(property_name: str, review: dict, issues: list[dict]) -> None:
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": "🔧 Tasks below — create manually in Breezeway until API is connected.",
+                    "text": "🔧 Tasks below — create manually in Breezeway until API is connected. 🔒 = from private feedback only.",
                 }
             ],
         },
@@ -182,8 +185,10 @@ def post_to_slack(property_name: str, review: dict, issues: list[dict]) -> None:
 
 def post_no_issues_summary(count: int) -> None:
     """Post a brief all-clear if no maintenance items were found."""
-    today = datetime.utcnow().strftime("%b %d, %Y")
-    requests.post(
+    from datetime import timezone
+    today = datetime.now(timezone.utc).strftime("%b %d, %Y")
+    print(f"[Slack] Posting all-clear to #{SLACK_CHANNEL}...")
+    resp = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={
             "Authorization": f"Bearer {SLACK_TOKEN}",
@@ -195,12 +200,18 @@ def post_no_issues_summary(count: int) -> None:
         },
         timeout=15,
     )
+    data = resp.json()
+    if data.get("ok"):
+        print(f"[Slack] ✅ All-clear posted successfully!")
+    else:
+        print(f"[Slack] ❌ Failed to post: {data.get('error')} | Full response: {data}")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
+    from datetime import timezone
     print(f"\n{'='*60}")
-    print(f"Review Maintenance Agent — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"Review Maintenance Agent — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*60}")
 
     reviews = get_recent_reviews(days_back=1)
@@ -211,16 +222,32 @@ def run():
         return
 
     total_issues = 0
-    property_cache = {}  # cache property names to avoid repeat API calls
+    property_cache = {}
 
     for review in reviews:
-        # Pull review text — field names vary slightly in OwnerRez API
-        text_fields = ["comments", "body", "review_text", "text", "public_review"]
-        review_text = next((review.get(f) for f in text_fields if review.get(f)), None)
+        # Pull public review text
+        public_fields = ["comments", "body", "review_text", "text", "public_review"]
+        public_text = next((review.get(f) for f in public_fields if review.get(f)), None)
 
-        if not review_text:
+        # Pull private feedback — log all keys first run so we can confirm field name
+        private_fields = ["private_feedback", "private_comments", "private_notes", "feedback"]
+        private_text = next((review.get(f) for f in private_fields if review.get(f)), None)
+
+        # Log keys to help identify private feedback field name in OwnerRez response
+        print(f"[Agent] Review {review.get('id')} fields: {list(review.keys())}")
+        if private_text:
+            print(f"[Agent] ✅ Private feedback found for review {review.get('id')}")
+
+        if not public_text and not private_text:
             print(f"[Agent] Review {review.get('id')} has no text — skipping")
             continue
+
+        # Combine public and private for Claude, clearly labeled
+        combined_text = ""
+        if public_text:
+            combined_text += f"PUBLIC REVIEW:\n{public_text}\n\n"
+        if private_text:
+            combined_text += f"PRIVATE FEEDBACK:\n{private_text}"
 
         # Get property name
         prop_id = review.get("property_id") or review.get("home_id")
@@ -229,7 +256,7 @@ def run():
         prop_name = property_cache[prop_id]
 
         print(f"\n[Agent] Analyzing review for {prop_name}...")
-        issues = analyze_review(review_text)
+        issues = analyze_review(combined_text)
 
         if issues:
             print(f"[Agent] Found {len(issues)} maintenance item(s)")
