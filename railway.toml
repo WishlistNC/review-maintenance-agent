@@ -4,6 +4,6 @@ builder = "NIXPACKS"
 
 [deploy]
 startCommand = "python agent.py"
-cronSchedule = "0 8 * * *"   # runs every day at 8:00 AM UTC (adjust to your timezone)
+cronSchedule = "0 12 * * *"   # runs every day at 8:00 AM EST (adjust to your timezone)
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
